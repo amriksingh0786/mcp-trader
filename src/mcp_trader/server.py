@@ -588,7 +588,7 @@ Technical Levels:
             request_id,
             "suggest_stops",
             True,
-            f"Suggested stop levels for {symbol} at ${latest_close:.2f}",
+            f"Suggested stop levels for {symbol} ({market_label}) at {currency}{latest_close:.2f}",
         )
         return stops_text
 

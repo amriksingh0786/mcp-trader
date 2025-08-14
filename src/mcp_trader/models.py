@@ -56,7 +56,8 @@ class MarketDataResponse(BaseModel):
 
     symbol: str = Field(..., description="Trading symbol")
     data: list[CandleData] = Field(..., description="Historical candle data")
-    provider: Literal["tiingo", "binance"] = Field(..., description="Data provider")
+    provider: Literal["tiingo", "binance", "yfinance"] = Field(..., description="Data provider")
+    market: Literal["us", "crypto", "in"] = Field("us", description="Market region")
     lookback_days: int = Field(..., gt=0, description="Number of days of data")
     quote_currency: str | None = Field(None, description="Quote currency for crypto pairs")
 
@@ -301,6 +302,15 @@ class AnalyzeStockRequest(BaseModel):
     """Request model for stock analysis."""
 
     symbol: str = Field(..., description="Stock symbol to analyze")
+    market: str = Field("us", description="Market region ('us' or 'in' for India)")
+    lookback_days: int | None = Field(365, gt=0, description="Days of historical data")
+
+
+class AnalyzeIndianStockRequest(BaseModel):
+    """Request model for Indian stock analysis."""
+
+    symbol: str = Field(..., description="Indian stock symbol to analyze")
+    exchange: Literal["NSE", "BSE"] = Field("NSE", description="Indian stock exchange")
     lookback_days: int | None = Field(365, gt=0, description="Days of historical data")
 
 
@@ -317,7 +327,8 @@ class RelativeStrengthRequest(BaseModel):
     """Request model for relative strength analysis."""
 
     symbol: str = Field(..., description="Stock symbol to analyze")
-    benchmark: str = Field("SPY", description="Benchmark symbol")
+    benchmark: str = Field("SPY", description="Benchmark symbol (SPY for US, NIFTY50.NS for India)")
+    market: str = Field("us", description="Market region ('us' or 'in' for India)")
     lookback_periods: list[int] = Field(
         default=[21, 63, 126, 252], description="Periods in trading days"
     )
@@ -327,6 +338,7 @@ class VolumeProfileRequest(BaseModel):
     """Request model for volume profile analysis."""
 
     symbol: str = Field(..., description="Stock symbol to analyze")
+    market: str = Field("us", description="Market region ('us' or 'in' for India)")
     lookback_days: int = Field(60, gt=0, description="Days to analyze")
     num_bins: int = Field(10, gt=0, le=50, description="Number of price bins")
 
@@ -335,6 +347,7 @@ class PatternDetectionRequest(BaseModel):
     """Request model for pattern detection."""
 
     symbol: str = Field(..., description="Stock symbol to analyze")
+    market: str = Field("us", description="Market region ('us' or 'in' for India)")
     lookback_days: int = Field(90, gt=0, description="Days to analyze")
 
 
@@ -342,6 +355,7 @@ class PositionSizeRequest(BaseModel):
     """Request model for position sizing."""
 
     symbol: str = Field(..., description="Stock symbol")
+    market: str = Field("us", description="Market region ('us' or 'in' for India)")
     price: float | None = Field(0, ge=0, description="Entry price (0 for current)")
     stop_price: float = Field(..., ge=0, description="Stop loss price")
     risk_amount: float = Field(..., gt=0, description="Dollar amount to risk")
@@ -353,6 +367,7 @@ class StopSuggestionRequest(BaseModel):
     """Request model for stop level suggestions."""
 
     symbol: str = Field(..., description="Stock symbol to analyze")
+    market: str = Field("us", description="Market region ('us' or 'in' for India)")
     lookback_days: int = Field(60, gt=0, description="Days for calculation")
 
 

@@ -1,9 +1,11 @@
+import asyncio
 import os
 from datetime import datetime, timedelta
 from typing import Any
 
 import aiohttp
 import pandas as pd
+import yfinance as yf
 from dotenv import load_dotenv
 
 try:
@@ -20,18 +22,55 @@ if USE_FASTMCP:
     mcp = FastMCP("mcp-trader-resources")
 
 
+def normalize_indian_symbol(symbol: str, exchange: str = "NSE") -> str:
+    """
+    Normalize Indian stock symbol to proper format.
+    
+    Args:
+        symbol: Stock symbol (e.g., 'RELIANCE', 'RELIANCE.NS')
+        exchange: Exchange code ('NSE' or 'BSE')
+    
+    Returns:
+        Normalized symbol (e.g., 'RELIANCE.NS')
+    """
+    symbol_upper = symbol.upper()
+    
+    # If already has exchange suffix, return as-is
+    if symbol_upper.endswith('.NS') or symbol_upper.endswith('.BO'):
+        return symbol_upper
+    
+    # Add appropriate suffix based on exchange
+    suffix = '.NS' if exchange.upper() == 'NSE' else '.BO'
+    return f"{symbol_upper}{suffix}"
+
+
+def is_indian_symbol(symbol: str) -> bool:
+    """
+    Check if symbol is an Indian stock symbol.
+    
+    Args:
+        symbol: Stock symbol to check
+    
+    Returns:
+        True if symbol appears to be Indian stock
+    """
+    symbol_upper = symbol.upper()
+    return symbol_upper.endswith('.NS') or symbol_upper.endswith('.BO')
+
+
 class MarketData:
     """Handles all market data fetching operations."""
 
     def __init__(self):
         self.api_key = os.getenv("TIINGO_API_KEY")
-        if not self.api_key:
-            raise ValueError("TIINGO_API_KEY not found in environment")
-
-        self.headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Token {self.api_key}",
-        }
+        # Don't require API key if using other providers
+        self.has_tiingo = bool(self.api_key)
+        
+        if self.has_tiingo:
+            self.headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Token {self.api_key}",
+            }
 
     async def get_crypto_historical_data(
         self,
@@ -169,13 +208,21 @@ class MarketData:
         else:
             raise ValueError(f"Unsupported provider: {provider}")
 
-    async def get_historical_data(self, symbol: str, lookback_days: int = 365) -> pd.DataFrame:
+    async def get_historical_data(
+        self, 
+        symbol: str, 
+        lookback_days: int = 365, 
+        provider: str = "tiingo", 
+        market: str = "us"
+    ) -> pd.DataFrame:
         """
         Fetch historical daily data for a given symbol.
 
         Args:
             symbol (str): The stock symbol to fetch data for.
             lookback_days (int): Number of days to look back from today.
+            provider (str): Data provider ('tiingo' or 'yfinance').
+            market (str): Market region ('us' or 'in' for India).
 
         Returns:
             pd.DataFrame: DataFrame containing historical market data.
@@ -184,6 +231,26 @@ class MarketData:
             ValueError: If the symbol is invalid or no data is returned.
             Exception: For other unexpected issues during the fetch operation.
         """
+        # Auto-detect market and provider based on symbol
+        if is_indian_symbol(symbol) or market.lower() == "in":
+            provider = "yfinance"  # Force yfinance for Indian stocks
+            market = "in"
+            symbol = normalize_indian_symbol(symbol)
+        
+        if provider.lower() == "tiingo":
+            return await self._fetch_tiingo_data(symbol, lookback_days)
+        elif provider.lower() == "yfinance":
+            return await self._fetch_yfinance_data(symbol, lookback_days)
+        else:
+            raise ValueError(f"Unsupported provider: {provider}")
+    
+    async def _fetch_tiingo_data(self, symbol: str, lookback_days: int) -> pd.DataFrame:
+        """
+        Fetch data from Tiingo API.
+        """
+        if not self.has_tiingo:
+            raise ValueError("TIINGO_API_KEY not found in environment")
+            
         end_date = datetime.now()
         start_date = end_date - timedelta(days=lookback_days)
 
@@ -217,11 +284,77 @@ class MarketData:
             return df
 
         except aiohttp.ClientError as e:
-            raise ConnectionError(f"Network error while fetching data for {symbol}: {e}") from e
+            raise ConnectionError(f"Network error while fetching data for {symbol} (Tiingo): {e}") from e
         except ValueError as ve:
-            raise ve  # Propagate value errors (symbol issues, no data, etc.)
+            raise ve
         except Exception as e:
-            raise Exception(f"Unexpected error fetching data for {symbol}: {e}") from e
+            raise Exception(f"Unexpected error fetching data for {symbol} (Tiingo): {e}") from e
+    
+    async def _fetch_yfinance_data(self, symbol: str, lookback_days: int) -> pd.DataFrame:
+        """
+        Fetch data from Yahoo Finance via yfinance library.
+        """
+        try:
+            def fetch_data():
+                """
+                Synchronous data fetch function to run in executor.
+                """
+                ticker = yf.Ticker(symbol)
+                # Calculate period string for yfinance
+                if lookback_days <= 7:
+                    period = "7d"
+                elif lookback_days <= 30:
+                    period = "1mo"
+                elif lookback_days <= 90:
+                    period = "3mo"
+                elif lookback_days <= 180:
+                    period = "6mo"
+                elif lookback_days <= 365:
+                    period = "1y"
+                elif lookback_days <= 730:
+                    period = "2y"
+                elif lookback_days <= 1825:
+                    period = "5y"
+                else:
+                    period = "max"
+                
+                # Fetch historical data
+                data = ticker.history(period=period)
+                return data
+            
+            # Run synchronous yfinance call in executor
+            loop = asyncio.get_event_loop()
+            df = await loop.run_in_executor(None, fetch_data)
+            
+            if df.empty:
+                raise ValueError(f"No data returned for {symbol}")
+            
+            # Standardize column names to match Tiingo format
+            df.columns = df.columns.str.lower()
+            df = df.rename(columns={
+                'adj close': 'close'  # Use adjusted close as close
+            })
+            
+            # Ensure we have required columns
+            required_cols = ['open', 'high', 'low', 'close', 'volume']
+            missing_cols = [col for col in required_cols if col not in df.columns]
+            if missing_cols:
+                raise ValueError(f"Missing required columns: {missing_cols}")
+            
+            # Round prices to 2 decimal places
+            df[['open', 'high', 'low', 'close']] = df[['open', 'high', 'low', 'close']].round(2)
+            df['volume'] = df['volume'].astype(int)
+            df['symbol'] = symbol.upper()
+            
+            # Ensure index is named 'date'
+            df.index.name = 'date'
+            
+            return df[['open', 'high', 'low', 'close', 'volume', 'symbol']]
+            
+        except Exception as e:
+            if "No data found" in str(e) or "No timezone found" in str(e):
+                raise ValueError(f"Symbol not found or invalid: {symbol}")
+            raise Exception(f"Unexpected error fetching data for {symbol} (yfinance): {e}") from e
 
 
 # FastMCP Resources Implementation
@@ -241,27 +374,37 @@ if USE_FASTMCP:
         return (datetime.now() - cached["timestamp"]).total_seconds() < _cache_ttl
 
     @mcp.resource("stock://{symbol}")
-    async def get_stock_price(symbol: str) -> dict[str, Any]:
+    async def get_stock_price(symbol: str, market: str = "us") -> dict[str, Any]:
         """
         Get current and recent stock price data.
 
         Returns the latest price, daily change, and key statistics for a stock symbol.
+        Supports both US and Indian markets.
         """
-        cache_key = f"stock:{symbol}"
+        cache_key = f"stock:{symbol}:{market}"
 
         # Check cache first
         if _is_cache_valid(cache_key):
             return _resource_cache[cache_key]["data"]
 
         try:
+            # Auto-detect provider and normalize symbol
+            provider = "yfinance" if is_indian_symbol(symbol) or market.lower() == "in" else "tiingo"
+            if market.lower() == "in" or is_indian_symbol(symbol):
+                symbol = normalize_indian_symbol(symbol)
+                market = "in"
+            
             # Fetch last 5 days of data
-            df = await _market_data.get_historical_data(symbol, lookback_days=5)
+            df = await _market_data.get_historical_data(
+                symbol, lookback_days=5, provider=provider, market=market
+            )
 
             latest = df.iloc[-1]
             prev_close = df.iloc[-2]["close"] if len(df) > 1 else latest["close"]
 
             data = {
                 "symbol": symbol.upper(),
+                "market": market,
                 "price": float(latest["close"]),
                 "open": float(latest["open"]),
                 "high": float(latest["high"]),
@@ -270,7 +413,7 @@ if USE_FASTMCP:
                 "change": float(latest["close"] - prev_close),
                 "change_percent": float((latest["close"] - prev_close) / prev_close * 100),
                 "timestamp": datetime.now().isoformat(),
-                "source": "tiingo",
+                "provider": provider,
             }
 
             # Cache the result
@@ -279,23 +422,32 @@ if USE_FASTMCP:
             return data
 
         except Exception as e:
-            return {"error": str(e), "symbol": symbol, "timestamp": datetime.now().isoformat()}
+            return {"error": str(e), "symbol": symbol, "market": market, "timestamp": datetime.now().isoformat()}
 
     @mcp.resource("stock://{symbol}/history")
-    async def get_stock_history(symbol: str, days: int | None = 30) -> dict[str, Any]:
+    async def get_stock_history(symbol: str, days: int | None = 30, market: str = "us") -> dict[str, Any]:
         """
         Get historical stock price data.
 
         Returns OHLCV data for the specified number of days.
+        Supports both US and Indian markets.
         """
-        cache_key = f"stock:{symbol}:history:{days}"
+        cache_key = f"stock:{symbol}:history:{days}:{market}"
 
         # Check cache first
         if _is_cache_valid(cache_key):
             return _resource_cache[cache_key]["data"]
 
         try:
-            df = await _market_data.get_historical_data(symbol, lookback_days=days)
+            # Auto-detect provider and normalize symbol
+            provider = "yfinance" if is_indian_symbol(symbol) or market.lower() == "in" else "tiingo"
+            if market.lower() == "in" or is_indian_symbol(symbol):
+                symbol = normalize_indian_symbol(symbol)
+                market = "in"
+            
+            df = await _market_data.get_historical_data(
+                symbol, lookback_days=days, provider=provider, market=market
+            )
 
             # Convert DataFrame to list of dictionaries
             history = []
@@ -313,10 +465,11 @@ if USE_FASTMCP:
 
             data = {
                 "symbol": symbol.upper(),
+                "market": market,
                 "days": days,
                 "data": history,
                 "timestamp": datetime.now().isoformat(),
-                "source": "tiingo",
+                "provider": provider,
             }
 
             # Cache the result
@@ -325,7 +478,7 @@ if USE_FASTMCP:
             return data
 
         except Exception as e:
-            return {"error": str(e), "symbol": symbol, "timestamp": datetime.now().isoformat()}
+            return {"error": str(e), "symbol": symbol, "market": market, "timestamp": datetime.now().isoformat()}
 
     @mcp.resource("crypto://{symbol}")
     async def get_crypto_price(
@@ -447,6 +600,58 @@ if USE_FASTMCP:
             "message": "Cache cleared",
             "timestamp": datetime.now().isoformat(),
         }
+
+    @mcp.resource("indian-stock://{symbol}")
+    async def get_indian_stock_price(symbol: str, exchange: str = "NSE") -> dict[str, Any]:
+        """
+        Get current and recent Indian stock price data.
+        
+        Returns the latest price, daily change, and key statistics for an Indian stock symbol.
+        Automatically formats symbol with appropriate exchange suffix (.NS or .BO).
+        """
+        normalized_symbol = normalize_indian_symbol(symbol, exchange)
+        cache_key = f"indian-stock:{normalized_symbol}"
+        
+        # Check cache first
+        if _is_cache_valid(cache_key):
+            return _resource_cache[cache_key]["data"]
+        
+        try:
+            # Fetch last 5 days of data
+            df = await _market_data.get_historical_data(
+                normalized_symbol, lookback_days=5, provider="yfinance", market="in"
+            )
+            
+            latest = df.iloc[-1]
+            prev_close = df.iloc[-2]["close"] if len(df) > 1 else latest["close"]
+            
+            data = {
+                "symbol": normalized_symbol,
+                "exchange": exchange.upper(),
+                "market": "in",
+                "price": float(latest["close"]),
+                "open": float(latest["open"]),
+                "high": float(latest["high"]),
+                "low": float(latest["low"]),
+                "volume": int(latest["volume"]),
+                "change": float(latest["close"] - prev_close),
+                "change_percent": float((latest["close"] - prev_close) / prev_close * 100),
+                "timestamp": datetime.now().isoformat(),
+                "provider": "yfinance",
+            }
+            
+            # Cache the result
+            _resource_cache[cache_key] = {"data": data, "timestamp": datetime.now()}
+            
+            return data
+            
+        except Exception as e:
+            return {
+                "error": str(e), 
+                "symbol": normalized_symbol, 
+                "exchange": exchange,
+                "timestamp": datetime.now().isoformat()
+            }
 
     @mcp.resource("market://cache/status")
     async def cache_status() -> dict[str, Any]:
